@@ -22,7 +22,9 @@ import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.core.instrument.distribution.HistogramGauges;
 import io.micrometer.core.instrument.distribution.pause.PauseDetector;
 import io.micrometer.core.instrument.internal.DefaultMeter;
+import io.micrometer.core.instrument.util.DoubleFormat;
 import io.micrometer.core.instrument.util.HierarchicalNameMapper;
+import io.micrometer.core.instrument.util.TimeUtils;
 import io.micrometer.core.lang.Nullable;
 import io.micrometer.statsd.internal.*;
 import org.reactivestreams.Processor;
@@ -34,12 +36,13 @@ import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.UnicastProcessor;
 import reactor.netty.NettyPipeline;
-import reactor.netty.udp.UdpClient;
 import reactor.netty.tcp.TcpClient;
+import reactor.netty.udp.UdpClient;
 import reactor.util.concurrent.Queues;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -52,16 +55,16 @@ import java.util.stream.LongStream;
 
 /**
  * {@link MeterRegistry} for StatsD.
- *
+ * <p>
  * The following StatsD line protocols are supported:
  *
  * <ul>
- *   <li>Datadog (default)</li>
- *   <li>Etsy</li>
- *   <li>Telegraf</li>
- *   <li>Sysdig</li>
+ * <li>Datadog (default)</li>
+ * <li>Etsy</li>
+ * <li>Telegraf</li>
+ * <li>Sysdig</li>
  * </ul>
- *
+ * <p>
  * See {@link StatsdFlavor} for more details.
  *
  * @author Jon Schneider
@@ -119,19 +122,19 @@ public class StatsdMeterRegistry extends MeterRegistry {
         config().onMeterRemoved(meter -> {
             //noinspection SuspiciousMethodCalls
             meter.use(
-                this::removePollableMeter,
-                c -> ((StatsdCounter) c).shutdown(),
-                t -> ((StatsdTimer) t).shutdown(),
-                d -> ((StatsdDistributionSummary) d).shutdown(),
-                this::removePollableMeter,
-                this::removePollableMeter,
-                this::removePollableMeter,
-                this::removePollableMeter,
-                m -> {
-                    for (Measurement measurement : m.measure()) {
-                        pollableMeters.remove(m.getId().withTag(measurement.getStatistic()));
-                    }
-                });
+                    this::removePollableMeter,
+                    c -> ((StatsdCounter) c).shutdown(),
+                    t -> ((StatsdTimer) t).shutdown(),
+                    d -> ((StatsdDistributionSummary) d).shutdown(),
+                    this::removePollableMeter,
+                    this::removePollableMeter,
+                    this::removePollableMeter,
+                    this::removePollableMeter,
+                    m -> {
+                        for (Measurement measurement : m.measure()) {
+                            pollableMeters.remove(m.getId().withTag(measurement.getStatistic()));
+                        }
+                    });
         });
 
         if (config.enabled()) {
@@ -205,7 +208,7 @@ public class StatsdMeterRegistry extends MeterRegistry {
                 final Publisher<String> publisher;
                 if (statsdConfig.buffered()) {
                     publisher = BufferingFlux.create(Flux.from(processor), "\n", statsdConfig.maxPacketLength(), statsdConfig.pollingFrequency().toMillis())
-                        .onBackpressureLatest();
+                            .onBackpressureLatest();
                 } else {
                     publisher = processor;
                 }
@@ -308,6 +311,23 @@ public class StatsdMeterRegistry extends MeterRegistry {
                 .merge(config);
     }
 
+    private Map<Long, Counter> registerSlaCounters(Meter.Id id, DistributionStatisticConfig config) {
+        Map<Long, Counter> slaCounters = new HashMap<>();
+
+        if (config.getSlaBoundaries() != null) {
+            for (Long sla : config.getSlaBoundaries()) {
+                slaCounters.put(sla, Counter.builder(id.getName() + ".sla")
+                        .tags(Tags.concat(id.getTagsAsIterable(), "le",
+                                id.getType() == Meter.Type.TIMER
+                                ? DoubleFormat.decimalOrNan(TimeUtils.nanosToUnit(sla.doubleValue(),
+                                TimeUnit.MILLISECONDS)): sla.toString()))
+                        .synthetic(id)
+                        .register(this));
+            }
+        }
+        return slaCounters;
+    }
+
     @Override
     protected Counter newCounter(Meter.Id id) {
         return new StatsdCounter(id, lineBuilder(id), processor);
@@ -324,14 +344,18 @@ public class StatsdMeterRegistry extends MeterRegistry {
     @Override
     protected Timer newTimer(Meter.Id id, DistributionStatisticConfig distributionStatisticConfig, PauseDetector
             pauseDetector) {
+        Map<Long, Counter> slaCounters = null;
 
-        // Adds an infinity bucket for SLA violation calculation
         if (distributionStatisticConfig.getSlaBoundaries() != null) {
+            // Registers counters for each SLA boundary
+            slaCounters = registerSlaCounters(id, distributionStatisticConfig);
+            // Adds an infinity bucket for SLA violation calculation
             distributionStatisticConfig = addInfBucket(distributionStatisticConfig);
+
         }
 
         Timer timer = new StatsdTimer(id, lineBuilder(id), processor, clock, distributionStatisticConfig, pauseDetector, getBaseTimeUnit(),
-                statsdConfig.step().toMillis());
+                statsdConfig.step().toMillis(), slaCounters);
         HistogramGauges.registerWithCommonFormat(timer, this);
         return timer;
     }
@@ -340,13 +364,17 @@ public class StatsdMeterRegistry extends MeterRegistry {
     @Override
     protected DistributionSummary newDistributionSummary(Meter.Id id, DistributionStatisticConfig
             distributionStatisticConfig, double scale) {
+        Map<Long, Counter> slaCounters = null;
 
         // Adds an infinity bucket for SLA violation calculation
         if (distributionStatisticConfig.getSlaBoundaries() != null) {
+            // Registers counters for each SLA boundary
+            slaCounters = registerSlaCounters(id, distributionStatisticConfig);
+            // Adds an infinity bucket for SLA violation calculation
             distributionStatisticConfig = addInfBucket(distributionStatisticConfig);
         }
 
-        DistributionSummary summary = new StatsdDistributionSummary(id, lineBuilder(id), processor, clock, distributionStatisticConfig, scale);
+        DistributionSummary summary = new StatsdDistributionSummary(id, lineBuilder(id), processor, clock, distributionStatisticConfig, scale, slaCounters);
         HistogramGauges.registerWithCommonFormat(summary, this);
         return summary;
     }
